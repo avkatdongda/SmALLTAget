@@ -1,195 +1,324 @@
 function run_all_trad_roc()
 % run_all_trad_roc
 % ========================================================================
-% 【主入口脚本】一键运行“红外小目标检测传统算法对比实验（单帧、点标注）”。
-% 该函数会遍历 7 个算法 × data1..data10 序列，并生成每个组合的 ROC/AUC 结果。
-% 
-% 你只需要在 MATLAB 命令行中执行：
-%   run_all_trad_roc
-% 
-% 本文件承担以下职责：
-%   1) 统一配置参数（路径、抽帧策略、采样数、随机种子等）。
-%   2) 注册算法并统一接口到 S = algo_fun(I)。
-%   3) 循环调用 eval_one_alg_one_seq_roc 完成单算法单序列评测。
-%   4) 汇总 AUC 到 summary_auc.csv 与 overall_rank.csv。
-% 
-% 评测口径关键点（严格统一）：
-%   - 输入图像统一：若 RGB 则取第一通道，再转 double。
-%   - 输出打分图统一：每帧 min-max 归一化到 [0,1]。
-%   - 正样本：GT 点中心 9x9 ROI（roi_r=4）。
-%   - 负样本：ROI 外像素，按帧随机下采样。
+% 主入口：一键运行像素级 ROC + 目标级 Pd-FP/frame，并输出单算法结果和叠加图。
 % ========================================================================
 
     % ------------------------- 0) 基础路径配置 -------------------------
-    % 数据根目录（严格按你的真实目录结构）。
     cfg.root_dir = "E:/dimifrdata";
-    % 算法目录（包含 AdMD7_eff/BLCM/...）。
     cfg.baseline_root = fullfile(cfg.root_dir, "baselines");
-    % 输出目录（所有 ROC 图、CSV、MAT、汇总表都会写到这里）。
     cfg.out_dir = "E:/dimifrdata/results_trad_roc";
 
-    % ------------------------- 1) 评测参数配置 -------------------------
-    % 需要跑哪些序列，默认 data1..data10。
+    % ------------------------- 1) 评测参数 -------------------------
     cfg.seq_ids = 1:10;
-    % 抽帧步长：1=每帧都跑；5=每隔5帧跑一帧。
     cfg.frame_stride = 5;
-    % 每个序列最多处理多少帧，0 表示不限制。
     cfg.max_frames_per_seq = 200;
-    % ROI 半径，roi_r=4 对应 9x9 ROI。
     cfg.roi_r = 4;
-    % 每帧最多采样多少个负样本像素，控制内存与速度。
     cfg.neg_sample_per_frame = 20000;
-    % 固定随机种子，保证可复现。
     cfg.rng_seed = 0;
-    % 是否使用并行（需要 Parallel Toolbox）。
     cfg.use_parallel = false;
-    % 帧级日志打印间隔（每处理多少帧打印一次进度）。
     cfg.print_every = 10;
-    % ROC 阈值数量（fallback 实现会用到）。
     cfg.n_thresholds = 2000;
-    % 是否运行快速测试：true 时只跑 data1 + 前20帧 + 前2算法。
     cfg.quick_test = false;
 
-    % ------------------------- 2) 快速测试配置 -------------------------
-    % 如果你希望快速验证代码是否跑通，把上面的 cfg.quick_test 改为 true。
+    % 目标级评测参数：阈值扫描列表与近邻合并半径。
+    cfg.th_list_target = linspace(0, 1, 80);
+    cfg.r_merge = 3;
+
+    % quick test：只跑 data1 + 前20帧 + 前2算法。
     if cfg.quick_test
-        % quick test 只跑 data1。
         cfg.seq_ids = 1;
-        % quick test 每帧都跑，便于快速看到输出。
         cfg.frame_stride = 1;
-        % quick test 限制前20帧。
         cfg.max_frames_per_seq = 20;
     end
 
-    % ------------------------- 3) 环境准备 -------------------------
-    % 固定随机种子，确保每次负样本采样一致，可复现。
+    % ------------------------- 2) 环境准备 -------------------------
     rng(cfg.rng_seed);
-    % 把 baseline 目录递归加入路径，保证算法函数可调用。
     addpath(genpath(cfg.baseline_root));
-    % 把当前工程目录（含 utils）加入路径。
     addpath(genpath(fileparts(mfilename('fullpath'))));
-    % 创建输出目录（不存在就自动创建）。
     if ~exist(cfg.out_dir, 'dir')
         mkdir(cfg.out_dir);
     end
 
-    % ------------------------- 4) 注册算法 -------------------------
-    % 注册函数会自动统一 7 个算法接口，并处理 TLLCM/WSLCM 脚本兼容。
+    % ------------------------- 3) 算法注册 -------------------------
     algs = registry_trad_algorithms(cfg.baseline_root);
-    % quick test 时只取前2个算法，便于快速跑通。
     if cfg.quick_test
         algs = algs(1:min(2, numel(algs)));
     end
 
-    % ------------------------- 5) 结果表初始化 -------------------------
-    % 算法数量。
     n_alg = numel(algs);
-    % 序列数量。
     n_seq = numel(cfg.seq_ids);
-    % AUC 矩阵：行=算法，列=序列。
+
+    % AUC 与目标级指标矩阵。
     auc_mat = nan(n_alg, n_seq);
+    pd05_mat = nan(n_alg, n_seq);
+    pd1_mat = nan(n_alg, n_seq);
 
-    % ------------------------- 6) 主循环：算法 × 序列 -------------------------
-    % 这里采用“外层算法，内层序列”的结构，方便按算法查看进度。
-    for ai = 1:n_alg
-        % 当前算法名字（例如 BLCM）。
-        alg_name = algs(ai).name;
-        % 当前算法函数句柄（统一成 S=fun(I)）。
-        alg_fun = algs(ai).fun;
+    % 用 cell 保存每个算法×序列的曲线，供 overlay 与 overall 平均使用。
+    pixel_curves = cell(n_alg, n_seq);
+    target_curves = cell(n_alg, n_seq);
 
-        % 算法级进度打印。
-        fprintf('\n==================== 算法 %d/%d: %s ====================\n', ai, n_alg, alg_name);
-
-        % 可选并行：每个序列彼此独立，因此可以并行。
-        if cfg.use_parallel && license('test', 'Distrib_Computing_Toolbox')
-            % 并行分支：每个 worker 处理一个序列。
-            parfor si = 1:n_seq
-                % 当前序列编号（1..10）。
-                seq_id = cfg.seq_ids(si);
-                % 调用 helper，返回该算法在该序列的评测结果。
-                auc_val = run_one_seq(alg_name, alg_fun, seq_id, cfg);
-                % 写回 AUC。
-                auc_mat(ai, si) = auc_val;
-            end
-        else
-            % 串行分支：兼容没有并行工具箱的环境。
-            for si = 1:n_seq
-                % 当前序列编号（1..10）。
-                seq_id = cfg.seq_ids(si);
-                % 调用 helper，返回 AUC。
-                auc_mat(ai, si) = run_one_seq(alg_name, alg_fun, seq_id, cfg);
-            end
-        end
-    end
-
-    % ------------------------- 7) 写 summary_auc.csv -------------------------
-    % 构造表头：Algorithm, data1..data10, mean_AUC。
-    var_names = cell(1, n_seq + 2);
-    var_names{1} = 'Algorithm';
+    % ------------------------- 4) 主循环：按序列组织 -------------------------
     for si = 1:n_seq
-        var_names{si + 1} = sprintf('data%d', cfg.seq_ids(si));
-    end
-    var_names{end} = 'mean_AUC';
+        seq_id = cfg.seq_ids(si);
+        seq_name = sprintf('data%d', seq_id);
 
-    % 构造单元格（第一列算法名 + 每列 AUC + 均值）。
-    out_cell = cell(n_alg, n_seq + 2);
-    for ai = 1:n_alg
-        out_cell{ai, 1} = algs(ai).name;
-        for si = 1:n_seq
-            out_cell{ai, si + 1} = auc_mat(ai, si);
+        fprintf('\n==================== 序列 %s (%d/%d) ====================\n', seq_name, si, n_seq);
+
+        for ai = 1:n_alg
+            alg_name = algs(ai).name;
+            alg_fun = algs(ai).fun;
+
+            fprintf('[%s] 处理序列 %s\n', alg_name, seq_name);
+
+            result = run_one_seq(alg_name, alg_fun, seq_id, cfg);
+
+            auc_mat(ai, si) = result.AUC;
+            pd05_mat(ai, si) = result.Pd_at_FP_05;
+            pd1_mat(ai, si) = result.Pd_at_FP_1;
+
+            pixel_curves{ai, si} = struct('FPR', result.FPR(:), 'TPR', result.TPR(:), 'AUC', result.AUC);
+            target_curves{ai, si} = struct('FP', result.FPu_target(:), 'Pd', result.PDu_target(:), ...
+                'Pd05', result.Pd_at_FP_05, 'Pd1', result.Pd_at_FP_1);
+
+            fprintf('[%s] %s 完成，AUC=%.6f，Pd@FP<=0.5=%.4f\n', alg_name, seq_name, result.AUC, result.Pd_at_FP_05);
         end
-        out_cell{ai, end} = mean(auc_mat(ai, :), 'omitnan');
+
+        % ------------------- 4.1 生成该序列的 4 张 overlay 图 -------------------
+        save_overlay_for_one_seq(cfg.out_dir, seq_id, algs, pixel_curves(:,si), target_curves(:,si));
+
+        % ------------------- 4.2 命令行打印 Top3 -------------------
+        print_top3_for_seq(seq_name, algs, auc_mat(:,si), pd05_mat(:,si));
     end
 
-    % 单元格转 table，便于导出 CSV。
-    summary_tbl = cell2table(out_cell, 'VariableNames', var_names);
-    % 写 summary_auc.csv。
-    writetable(summary_tbl, fullfile(cfg.out_dir, 'summary_auc.csv'));
+    % ------------------------- 5) 汇总表 -------------------------
+    write_summary_tables(cfg.out_dir, cfg.seq_ids, algs, auc_mat, pd05_mat, pd1_mat);
 
-    % ------------------------- 8) 写 overall_rank.csv -------------------------
-    % 按 mean_AUC 从高到低排序。
-    mean_auc = cell2mat(out_cell(:, end));
-    [sorted_mean, order] = sort(mean_auc, 'descend', 'MissingPlacement', 'last');
+    % ------------------------- 6) 全局平均叠加图 -------------------------
+    save_overall_mean_overlays(cfg.out_dir, algs, pixel_curves, target_curves);
 
-    % 排名表内容：Rank, Algorithm, mean_AUC。
-    rank_tbl = table((1:n_alg)', string(summary_tbl.Algorithm(order)), sorted_mean, ...
-        'VariableNames', {'Rank', 'Algorithm', 'mean_AUC'});
-    % 写 overall_rank.csv。
-    writetable(rank_tbl, fullfile(cfg.out_dir, 'overall_rank.csv'));
-
-    % ------------------------- 9) 结束打印 -------------------------
     fprintf('\n全部任务完成，输出目录：%s\n', cfg.out_dir);
 end
 
-function auc_val = run_one_seq(alg_name, alg_fun, seq_id, cfg)
+function result = run_one_seq(alg_name, alg_fun, seq_id, cfg)
 % run_one_seq
-% ========================================================================
-% 这个局部函数只做一件事：
-%   调用 eval_one_alg_one_seq_roc，执行“一个算法 + 一个序列”的完整评测。
-% 将路径拼接与异常保护放在这里，主循环更清晰。
-% ========================================================================
+% 单算法单序列执行包装，负责路径拼接。
 
-    % 序列名，例如 data1。
     seq_name = sprintf('data%d', seq_id);
-    % 图像目录，严格匹配你的真实结构：E:/dimifrdata/dataX/dataX/*.bmp
     img_dir = fullfile(cfg.root_dir, seq_name, seq_name);
-    % GT 文件路径：E:/dimifrdata/data_label/dataX.txt
     gt_path = fullfile(cfg.root_dir, 'data_label', sprintf('%s.txt', seq_name));
 
-    % 打印序列级进度。
-    fprintf('[%s] 处理序列 %s\n', alg_name, seq_name);
+    result = eval_one_alg_one_seq_roc(alg_name, alg_fun, img_dir, gt_path, cfg);
+end
 
-    % 用 try-catch 包住单序列，防止某一序列异常导致全局中断。
-    try
-        % 调用单序列评测函数。
-        result = eval_one_alg_one_seq_roc(alg_name, alg_fun, img_dir, gt_path, cfg);
-        % 提取 AUC。
-        auc_val = result.AUC;
-        % 打印该序列 AUC。
-        fprintf('[%s] %s 完成，AUC=%.6f，有效帧=%d\n', alg_name, seq_name, auc_val, result.N_used_frames);
-    catch ME
-        % 如果该序列失败，打印 warning 并返回 NaN。
-        warning('[%s] %s 失败：%s', alg_name, seq_name, ME.message);
-        auc_val = NaN;
+function save_overlay_for_one_seq(out_dir, seq_id, algs, pix_cells, tgt_cells)
+% save_overlay_for_one_seq
+% 作用：对同一序列叠加所有算法曲线，输出 4 张 overlay 图。
+
+    seq_name = sprintf('data%d', seq_id);
+
+    % ------------------- 1) Pixel ROC overlay (linear) -------------------
+    fig1 = figure('Visible', 'off');
+    hold on;
+    leg1 = cell(numel(algs),1);
+    for i = 1:numel(algs)
+        c = pix_cells{i};
+        plot(c.FPR, c.TPR, 'LineWidth', 1.4);
+        leg1{i} = sprintf('%s (AUC=%.3f)', algs(i).name, c.AUC);
     end
+    grid on; xlim([0,1]); ylim([0,1]);
+    xlabel('FPR'); ylabel('TPR');
+    title(sprintf('%s | Pixel ROC Overlay', seq_name));
+    legend(leg1, 'Location', 'southeast');
+    exportgraphics(fig1, fullfile(out_dir, sprintf('overlay_data%02d_pixelROC.png', seq_id)), 'Resolution', 150);
+    close(fig1);
+
+    % ------------------- 2) Pixel ROC overlay (log-x) -------------------
+    fig2 = figure('Visible', 'off');
+    hold on;
+    for i = 1:numel(algs)
+        c = pix_cells{i};
+        fpr_log = max(c.FPR, 1e-8);
+        semilogx(fpr_log, c.TPR, 'LineWidth', 1.4);
+    end
+    grid on; xlim([1e-8,1]); ylim([0,1]);
+    xlabel('FPR (log scale)'); ylabel('TPR');
+    title(sprintf('%s | Pixel ROC Overlay (log-x)', seq_name));
+    legend(leg1, 'Location', 'southeast');
+    exportgraphics(fig2, fullfile(out_dir, sprintf('overlay_data%02d_pixelROC_logx.png', seq_id)), 'Resolution', 150);
+    close(fig2);
+
+    % ------------------- 3) Target Pd-FP overlay (linear) -------------------
+    fig3 = figure('Visible', 'off');
+    hold on;
+    leg3 = cell(numel(algs),1);
+    for i = 1:numel(algs)
+        c = tgt_cells{i};
+        plot(c.FP, c.Pd, 'LineWidth', 1.6);
+        leg3{i} = sprintf('%s (Pd@FP<=0.5=%.3f)', algs(i).name, c.Pd05);
+    end
+    grid on; ylim([0,1]);
+    xlabel('FP / frame'); ylabel('Pd');
+    title(sprintf('%s | Target-level Pd-FP/frame Overlay', seq_name));
+    legend(leg3, 'Location', 'southeast');
+    exportgraphics(fig3, fullfile(out_dir, sprintf('overlay_data%02d_targetPdFP.png', seq_id)), 'Resolution', 150);
+    close(fig3);
+
+    % ------------------- 4) Target Pd-FP overlay (log-x) -------------------
+    fig4 = figure('Visible', 'off');
+    hold on;
+    for i = 1:numel(algs)
+        c = tgt_cells{i};
+        fp_log = max(c.FP, 1e-6);
+        semilogx(fp_log, c.Pd, 'LineWidth', 1.6);
+    end
+    grid on; xlim([1e-6, max(1, max_cell_fp(tgt_cells))]); ylim([0,1]);
+    xlabel('FP / frame (log scale)'); ylabel('Pd');
+    title(sprintf('%s | Target-level Pd-FP/frame Overlay (log-x)', seq_name));
+    legend(leg3, 'Location', 'southeast');
+    exportgraphics(fig4, fullfile(out_dir, sprintf('overlay_data%02d_targetPdFP_logx.png', seq_id)), 'Resolution', 150);
+    close(fig4);
+end
+
+function v = max_cell_fp(tgt_cells)
+% 计算目标级曲线中的最大 FP，用于设置 log-x 上限。
+    v = 0;
+    for i = 1:numel(tgt_cells)
+        c = tgt_cells{i};
+        if ~isempty(c.FP)
+            v = max(v, max(c.FP));
+        end
+    end
+    if v <= 0
+        v = 1;
+    end
+end
+
+function print_top3_for_seq(seq_name, algs, auc_col, pd05_col)
+% print_top3_for_seq
+% 每个序列完成后打印 AUC Top3 与 Pd@FP<=0.5 Top3。
+
+    [auc_sorted, ia] = sort(auc_col, 'descend', 'MissingPlacement', 'last');
+    [pd_sorted, ip] = sort(pd05_col, 'descend', 'MissingPlacement', 'last');
+
+    k1 = min(3, numel(algs));
+    fprintf('--- %s AUC Top%d ---\n', seq_name, k1);
+    for t = 1:k1
+        fprintf('  %d) %s : %.6f\n', t, algs(ia(t)).name, auc_sorted(t));
+    end
+
+    k2 = min(3, numel(algs));
+    fprintf('--- %s Pd@FP<=0.5 Top%d ---\n', seq_name, k2);
+    for t = 1:k2
+        fprintf('  %d) %s : %.6f\n', t, algs(ip(t)).name, pd_sorted(t));
+    end
+end
+
+function write_summary_tables(out_dir, seq_ids, algs, auc_mat, pd05_mat, pd1_mat)
+% write_summary_tables
+% 写出 summary_auc.csv / overall_rank.csv / overall_mean_metrics.csv。
+
+    n_alg = numel(algs);
+    n_seq = numel(seq_ids);
+
+    % ---------- summary_auc.csv ----------
+    var_names = cell(1, n_seq + 2);
+    var_names{1} = 'Algorithm';
+    for si = 1:n_seq
+        var_names{si + 1} = sprintf('data%d', seq_ids(si));
+    end
+    var_names{end} = 'mean_AUC';
+
+    out_cell = cell(n_alg, n_seq + 2);
+    for ai = 1:n_alg
+        out_cell{ai,1} = algs(ai).name;
+        for si = 1:n_seq
+            out_cell{ai,si+1} = auc_mat(ai,si);
+        end
+        out_cell{ai,end} = mean(auc_mat(ai,:), 'omitnan');
+    end
+    summary_tbl = cell2table(out_cell, 'VariableNames', var_names);
+    writetable(summary_tbl, fullfile(out_dir, 'summary_auc.csv'));
+
+    % ---------- overall_rank.csv ----------
+    mean_auc = cell2mat(out_cell(:,end));
+    [sorted_mean, ord] = sort(mean_auc, 'descend', 'MissingPlacement', 'last');
+    rank_tbl = table((1:n_alg)', string(summary_tbl.Algorithm(ord)), sorted_mean, ...
+        'VariableNames', {'Rank', 'Algorithm', 'mean_AUC'});
+    writetable(rank_tbl, fullfile(out_dir, 'overall_rank.csv'));
+
+    % ---------- overall_mean_metrics.csv ----------
+    alg_names = strings(n_alg,1);
+    mean_auc_v = nan(n_alg,1);
+    mean_pd05_v = nan(n_alg,1);
+    mean_pd1_v = nan(n_alg,1);
+    for ai = 1:n_alg
+        alg_names(ai) = string(algs(ai).name);
+        mean_auc_v(ai) = mean(auc_mat(ai,:), 'omitnan');
+        mean_pd05_v(ai) = mean(pd05_mat(ai,:), 'omitnan');
+        mean_pd1_v(ai) = mean(pd1_mat(ai,:), 'omitnan');
+    end
+    mean_tbl = table(alg_names, mean_auc_v, mean_pd05_v, mean_pd1_v, ...
+        'VariableNames', {'Algorithm','mean_AUC','mean_Pd_at_FP_le_0p5','mean_Pd_at_FP_le_1'});
+    writetable(mean_tbl, fullfile(out_dir, 'overall_mean_metrics.csv'));
+end
+
+function save_overall_mean_overlays(out_dir, algs, pixel_curves, target_curves)
+% save_overall_mean_overlays
+% 作用：Across datasets 做平均叠加图。
+
+    n_alg = numel(algs);
+    n_seq = size(pixel_curves, 2);
+
+    % ------------------- overall pixelROC mean -------------------
+    fpr_grid = linspace(0, 1, 600);
+    fig1 = figure('Visible', 'off');
+    hold on;
+    for ai = 1:n_alg
+        tmp = nan(n_seq, numel(fpr_grid));
+        for si = 1:n_seq
+            c = pixel_curves{ai,si};
+            if isempty(c) || isempty(c.FPR)
+                continue;
+            end
+            [x, ux] = unique(c.FPR(:), 'stable');
+            y = c.TPR(ux);
+            tmp(si,:) = interp1(x, y, fpr_grid, 'linear', 'extrap');
+        end
+        mtpr = mean(tmp, 1, 'omitnan');
+        mtpr = min(max(mtpr, 0), 1);
+        plot(fpr_grid, mtpr, 'LineWidth', 1.6);
+    end
+    grid on; xlim([0,1]); ylim([0,1]);
+    xlabel('FPR'); ylabel('Mean TPR');
+    title('Overall Mean Pixel ROC (data1..data10)');
+    legend(string({algs.name}), 'Location', 'southeast');
+    exportgraphics(fig1, fullfile(out_dir, 'overall_pixelROC_mean.png'), 'Resolution', 150);
+    close(fig1);
+
+    % ------------------- overall target Pd-FP mean -------------------
+    fp_grid = linspace(0, 2, 400);
+    fig2 = figure('Visible', 'off');
+    hold on;
+    for ai = 1:n_alg
+        tmp = nan(n_seq, numel(fp_grid));
+        for si = 1:n_seq
+            c = target_curves{ai,si};
+            if isempty(c) || isempty(c.FP)
+                continue;
+            end
+            [x, ux] = unique(c.FP(:), 'stable');
+            y = c.Pd(ux);
+            tmp(si,:) = interp1(x, y, fp_grid, 'linear', 'extrap');
+        end
+        mpd = mean(tmp, 1, 'omitnan');
+        mpd = min(max(mpd, 0), 1);
+        plot(fp_grid, mpd, 'LineWidth', 1.6);
+    end
+    grid on; ylim([0,1]);
+    xlabel('FP / frame'); ylabel('Mean Pd');
+    title('Overall Mean Target-level Pd-FP/frame (data1..data10)');
+    legend(string({algs.name}), 'Location', 'southeast');
+    exportgraphics(fig2, fullfile(out_dir, 'overall_targetPdFP_mean.png'), 'Resolution', 150);
+    close(fig2);
 end
